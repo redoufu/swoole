@@ -1,8 +1,8 @@
-Swoole
+![Swoole](http://www.swoole.com/static/images/swoole.png)
 =====
-[![Build Status](https://api.travis-ci.org/matyhtf/swoole.svg)](https://travis-ci.org/matyhtf/swoole)
+[![Build Status](https://api.travis-ci.org/swoole/swoole-src.svg)](https://travis-ci.org/swoole/swoole-src)
 
-PHP's asynchronous & concurrent & distributed networking framework.
+Asynchronous & concurrent & distributed networking framework for PHP.
 
 * event-driven
 * full asynchronous non-blocking
@@ -143,11 +143,15 @@ __Files__
 * C/C++: [examples/server.c](examples/server.c)
 * Client: [examples/client.php](examples/client.php)
 
+Document
+----
+* [Document 中文](http://www.swoole.com/wiki/index/) 
+* [Document English](https://github.com/matyhtf/swoole_doc/blob/master/docs/en/index.md) 
+
 Developer Mail-List
 -----
 * Google Group: <https://groups.google.com/forum/#!forum/swoole>  
 * Email: <swoole@googlegroups.com>
-
 
 For PHP
 -----
@@ -170,11 +174,6 @@ PHP Application Server
 -----
 https://github.com/matyhtf/swoole_framework
 
-
-Document
-----
-* [Document 中文](http://www.swoole.com/wiki/index/) 
-* Document English. Wait moment.
 
 License
 -----
