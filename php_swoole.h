@@ -8,7 +8,7 @@
   | http://www.apache.org/licenses/LICENSE-2.0.html                      |
   | If you did not receive a copy of the Apache2.0 license and are unable|
   | to obtain it through the world-wide-web, please send a note to       |
-  | license@php.net so we can mail you a copy immediately.               |
+  | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
   | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
   +----------------------------------------------------------------------+
@@ -24,6 +24,14 @@
 #include "php_globals.h"
 #include "php_main.h"
 
+#include "php_streams.h"
+#include "php_network.h"
+
+#include "zend_interfaces.h"
+#include "zend_exceptions.h"
+#include "zend_variables.h"
+#include <ext/date/php_date.h>
+#include <ext/standard/url.h>
 #include <ext/standard/info.h>
 
 #ifdef HAVE_CONFIG_H
@@ -35,7 +43,7 @@
 #include "Client.h"
 #include "async.h"
 
-#define PHP_SWOOLE_VERSION  "1.7.5-beta"
+#define PHP_SWOOLE_VERSION  "1.7.22-rc2"
 #define PHP_SWOOLE_CHECK_CALLBACK
 
 /**
@@ -51,13 +59,11 @@
 
 #define SW_HOST_SIZE  128
 
-#pragma pack(4)
 typedef struct
 {
-	uint16_t port;
-	uint16_t from_fd;
+    uint16_t port;
+    uint16_t from_fd;
 } php_swoole_udp_t;
-#pragma pack()
 
 extern zend_module_entry swoole_module_entry;
 
@@ -71,17 +77,37 @@ extern zend_module_entry swoole_module_entry;
 #	define PHP_SWOOLE_API
 #endif
 
+#define SWOOLE_PROPERTY_MAX     32
+#define SWOOLE_OBJECT_MAX       1000000
+
+typedef struct
+{
+    void **array;
+    uint32_t size;
+    void **property[SWOOLE_PROPERTY_MAX];
+    uint32_t property_size[SWOOLE_PROPERTY_MAX];
+} swoole_object_array;
+
 #ifdef ZTS
 #include "TSRM.h"
 extern void ***sw_thread_ctx;
+extern __thread swoole_object_array swoole_objects;
+#else
+extern swoole_object_array swoole_objects;
 #endif
+
+
 //#define SW_USE_PHP        1
-#define SW_HANDLE_NUM
 #define SW_CHECK_RETURN(s)         if(s<0){RETURN_FALSE;}else{RETURN_TRUE;}return
 #define SW_LOCK_CHECK_RETURN(s)    if(s==0){RETURN_TRUE;}else{RETURN_FALSE;}return
 
+#define swoole_php_error(level, fmt_str, ...)   if (SWOOLE_G(display_errors)) php_error_docref(NULL TSRMLS_CC, level, fmt_str, ##__VA_ARGS__)
+#define swoole_php_fatal_error(level, fmt_str, ...)   php_error_docref(NULL TSRMLS_CC, level, fmt_str, ##__VA_ARGS__)
+#define swoole_php_sys_error(level, fmt_str, ...)  if (SWOOLE_G(display_errors)) php_error_docref(NULL TSRMLS_CC, level, fmt_str" Error: %s[%d].", ##__VA_ARGS__, strerror(errno), errno)
+#define swoole_efree(p)  if (p) efree(p)
+
 #ifdef SW_ASYNC_MYSQL
-#if PHP_MAJOR_VERSION >= 5 && PHP_MINOR_VERSION >= 4 && defined(SW_HAVE_MYSQLI) && defined(SW_HAVE_MYSQLND)
+#if defined(SW_HAVE_MYSQLI) && defined(SW_HAVE_MYSQLND)
 #else
 #error "Enable async_mysql support, But no mysqli or mysqlnd."
 #undef SW_ASYNC_MYSQL
@@ -94,12 +120,16 @@ extern void ***sw_thread_ctx;
 #endif
 #endif
 
-#define SW_RES_SERVER_NAME          "SwooleServer"
-#define SW_RES_CLIENT_NAME          "SwooleClient"
-#define SW_RES_LOCK_NAME            "SwooleLock"
-#define SW_RES_PROCESS_NAME         "SwooleProcess"
-#define SW_RES_BUFFER_NAME          "SwooleBuffer"
-#define SW_RES_TABLE_NAME           "SwooleTable"
+#ifdef SW_SOCKETS
+#if PHP_VERSION_ID >= 50301 && (HAVE_SOCKETS || defined(COMPILE_DL_SOCKETS))
+#include "ext/sockets/php_sockets.h"
+#define SWOOLE_SOCKETS_SUPPORT
+#else
+#error "Enable sockets support, But no sockets extension"
+#endif
+#endif
+
+#include "php7_wrapper.h"
 
 #define PHP_CLIENT_CALLBACK_NUM             4
 //---------------------------------------------------
@@ -109,9 +139,9 @@ extern void ***sw_thread_ctx;
 #define SW_CLIENT_CB_onError                3
 
 #define SW_MAX_FIND_COUNT                   100    //for swoole_server::connection_list
-#define SW_PHP_CLIENT_BUFFER_SIZE           65536
+#define SW_PHP_CLIENT_BUFFER_SIZE           65535
 
-#define PHP_SERVER_CALLBACK_NUM             15
+#define PHP_SERVER_CALLBACK_NUM             17
 //--------------------------------------------------------
 #define SW_SERVER_CB_onStart                0 //Server start(master)
 #define SW_SERVER_CB_onConnect              1 //accept new connection(worker)
@@ -128,39 +158,50 @@ extern void ***sw_thread_ctx;
 #define SW_SERVER_CB_onWorkerError          12 //worker exception(manager)
 #define SW_SERVER_CB_onManagerStart         13
 #define SW_SERVER_CB_onManagerStop          14
+#define SW_SERVER_CB_onPipeMessage          15
+#define SW_SERVER_CB_onPacket               16 //udp packet
 //---------------------------------------------------------
-#define SW_FLAG_KEEP                        (1u << 9)
+#define SW_FLAG_KEEP                        (1u << 12)
 #define SW_FLAG_ASYNC                       (1u << 10)
 #define SW_FLAG_SYNC                        (1u << 11)
 //---------------------------------------------------------
-#define php_swoole_socktype(type)           (type & (~SW_FLAG_SYNC) & (~SW_FLAG_ASYNC) & (~SW_FLAG_KEEP))
+enum php_swoole_fd_type
+{
+    SW_FD_SWOOLE_CLIENT = SW_FD_USER + 1,
+    SW_FD_SWOOLE_MYSQL,
+};
+
+#define php_swoole_socktype(type)           (type & (~SW_FLAG_SYNC) & (~SW_FLAG_ASYNC) & (~SW_FLAG_KEEP) & (~SW_SOCK_SSL))
 #define php_swoole_array_length(array)      (Z_ARRVAL_P(array)->nNumOfElements)
 
 #define SW_LONG_CONNECTION_KEY_LEN          64
 
-extern int le_swoole_server;
-extern int le_swoole_client;
-extern int le_swoole_lock;
-extern int le_swoole_process;
-extern int le_swoole_buffer;
-extern int le_swoole_table;
-
 extern zend_class_entry *swoole_lock_class_entry_ptr;
 extern zend_class_entry *swoole_process_class_entry_ptr;
 extern zend_class_entry *swoole_client_class_entry_ptr;
+extern zend_class_entry *swoole_http_client_class_entry_ptr;
 extern zend_class_entry *swoole_server_class_entry_ptr;
+extern zend_class_entry *swoole_connection_iterator_class_entry_ptr;
 extern zend_class_entry *swoole_buffer_class_entry_ptr;
 extern zend_class_entry *swoole_table_class_entry_ptr;
+extern zend_class_entry *swoole_http_server_class_entry_ptr;
 
-extern HashTable php_sw_event_callback;
-extern HashTable php_sw_client_callback;
-extern HashTable php_sw_timer_callback;
-extern HashTable php_sw_long_connections;
-extern HashTable php_sw_aio_callback;
+extern zval *php_sw_callback[PHP_SERVER_CALLBACK_NUM];
 
-extern uint8_t php_sw_reactor_ok;
-extern uint8_t php_sw_reactor_wait_onexit;
-extern uint8_t php_sw_in_client;
+#define PHP_MEMORY_DEBUG  0
+
+#if PHP_MEMORY_DEBUG
+typedef struct
+{
+    int new_client;
+    int free_client;
+    int new_http_response;
+    int new_http_request;
+    int free_http_response;
+    int free_http_request;
+} php_vmstat_t;
+extern php_vmstat_t php_vmstat;
+#endif
 
 PHP_MINIT_FUNCTION(swoole);
 PHP_MSHUTDOWN_FUNCTION(swoole);
@@ -172,6 +213,7 @@ PHP_FUNCTION(swoole_version);
 PHP_FUNCTION(swoole_cpu_num);
 PHP_FUNCTION(swoole_set_process_name);
 PHP_FUNCTION(swoole_get_local_ip);
+
 PHP_FUNCTION(swoole_server_create);
 PHP_FUNCTION(swoole_server_set);
 PHP_FUNCTION(swoole_server_start);
@@ -183,7 +225,6 @@ PHP_FUNCTION(swoole_server_on);
 PHP_FUNCTION(swoole_server_handler);
 PHP_FUNCTION(swoole_server_addlisten);
 PHP_FUNCTION(swoole_server_addtimer);
-PHP_FUNCTION(swoole_server_deltimer);
 PHP_FUNCTION(swoole_server_gettimer);
 PHP_FUNCTION(swoole_server_task);
 PHP_FUNCTION(swoole_server_taskwait);
@@ -193,11 +234,32 @@ PHP_FUNCTION(swoole_server_shutdown);
 PHP_FUNCTION(swoole_server_heartbeat);
 PHP_FUNCTION(swoole_connection_list);
 PHP_FUNCTION(swoole_connection_info);
+
+#ifdef HAVE_PCRE
+PHP_METHOD(swoole_connection_iterator, count);
+PHP_METHOD(swoole_connection_iterator, rewind);
+PHP_METHOD(swoole_connection_iterator, next);
+PHP_METHOD(swoole_connection_iterator, current);
+PHP_METHOD(swoole_connection_iterator, key);
+PHP_METHOD(swoole_connection_iterator, valid);
+#endif
+
+PHP_METHOD(swoole_server, sendmessage);
+PHP_METHOD(swoole_server, addprocess);
 PHP_METHOD(swoole_server, stats);
+PHP_METHOD(swoole_server, bind);
+PHP_METHOD(swoole_server, sendto);
+PHP_METHOD(swoole_server, sendwait);
+PHP_METHOD(swoole_server, exist);
+
+#ifdef SWOOLE_SOCKETS_SUPPORT
+PHP_METHOD(swoole_server, getSocket);
+#endif
 
 PHP_FUNCTION(swoole_event_add);
 PHP_FUNCTION(swoole_event_set);
 PHP_FUNCTION(swoole_event_del);
+PHP_FUNCTION(swoole_event_write);
 PHP_FUNCTION(swoole_event_wait);
 PHP_FUNCTION(swoole_event_exit);
 
@@ -211,74 +273,84 @@ PHP_FUNCTION(swoole_async_set);
 
 PHP_FUNCTION(swoole_timer_add);
 PHP_FUNCTION(swoole_timer_del);
+PHP_FUNCTION(swoole_timer_after);
+PHP_FUNCTION(swoole_timer_tick);
+PHP_FUNCTION(swoole_timer_clear);
 
 PHP_FUNCTION(swoole_strerror);
 PHP_FUNCTION(swoole_errno);
 
 #ifdef SW_ASYNC_MYSQL
 PHP_FUNCTION(swoole_get_mysqli_sock);
+PHP_FUNCTION(swoole_mysql_query);
 #endif
 
 PHP_FUNCTION(swoole_client_select);
 
-PHP_METHOD(swoole_client, __construct);
-PHP_METHOD(swoole_client, connect);
-PHP_METHOD(swoole_client, recv);
-PHP_METHOD(swoole_client, send);
-PHP_METHOD(swoole_client, sendfile);
-PHP_METHOD(swoole_client, close);
-PHP_METHOD(swoole_client, on);
-
-PHP_METHOD(swoole_lock, __construct);
-PHP_METHOD(swoole_lock, lock);
-PHP_METHOD(swoole_lock, trylock);
-PHP_METHOD(swoole_lock, lock_read);
-PHP_METHOD(swoole_lock, trylock_read);
-PHP_METHOD(swoole_lock, unlock);
-
-PHP_METHOD(swoole_process, __construct);
-PHP_METHOD(swoole_process, kill);
-PHP_METHOD(swoole_process, wait);
-
-PHP_METHOD(swoole_process, start);
-PHP_METHOD(swoole_process, write);
-PHP_METHOD(swoole_process, read);
-PHP_METHOD(swoole_process, exit);
-PHP_METHOD(swoole_process, exec);
-
-PHP_METHOD(swoole_buffer, __construct);
-PHP_METHOD(swoole_buffer, append);
-PHP_METHOD(swoole_buffer, substr);
-PHP_METHOD(swoole_buffer, write);
-PHP_METHOD(swoole_buffer, expand);
-PHP_METHOD(swoole_buffer, clear);
-
-PHP_METHOD(swoole_table, __construct);
-PHP_METHOD(swoole_table, column);
-PHP_METHOD(swoole_table, create);
-PHP_METHOD(swoole_table, add);
-PHP_METHOD(swoole_table, get);
-
-PHP_METHOD(swoole_table, lock);
-PHP_METHOD(swoole_table, unlock);
-
-void swoole_destory_lock(zend_rsrc_list_entry *rsrc TSRMLS_DC);
-void swoole_destory_process(zend_rsrc_list_entry *rsrc TSRMLS_DC);
-void swoole_destory_buffer(zend_rsrc_list_entry *rsrc TSRMLS_DC);
-void swoole_destory_table(zend_rsrc_list_entry *rsrc TSRMLS_DC);
+void swoole_destory_table(zend_resource *rsrc TSRMLS_DC);
 
 void swoole_async_init(int module_number TSRMLS_DC);
 void swoole_table_init(int module_number TSRMLS_DC);
+void swoole_lock_init(int module_number TSRMLS_DC);
+void swoole_atomic_init(int module_number TSRMLS_DC);
+void swoole_client_init(int module_number TSRMLS_DC);
+void swoole_http_client_init(int module_number TSRMLS_DC);
+void swoole_process_init(int module_number TSRMLS_DC);
+void swoole_http_init(int module_number TSRMLS_DC);
+void swoole_websocket_init(int module_number TSRMLS_DC);
+void swoole_buffer_init(int module_number TSRMLS_DC);
+void swoole_mysql_init(int module_number TSRMLS_DC);
+
+int php_swoole_process_start(swWorker *process, zval *object TSRMLS_DC);
 
 void php_swoole_check_reactor();
-void php_swoole_try_run_reactor();
+void php_swoole_event_init();
+void php_swoole_event_wait();
+void php_swoole_check_timer(int interval);
+void php_swoole_register_callback(swServer *serv);
+
+static sw_inline void* swoole_get_object(zval *object)
+{
+#if PHP_MAJOR_VERSION < 7
+    zend_object_handle handle = Z_OBJ_HANDLE_P(object);
+#else
+    int handle = (int)Z_OBJ_HANDLE(*object);
+#endif
+    assert(handle < swoole_objects.size);
+    return swoole_objects.array[handle];
+}
+
+static sw_inline void* swoole_get_property(zval *object, int property_id)
+{
+#if PHP_MAJOR_VERSION < 7
+    zend_object_handle handle = Z_OBJ_HANDLE_P(object);
+#else
+    int handle = (int) Z_OBJ_HANDLE(*object);
+#endif
+    if (handle >= swoole_objects.property_size[property_id])
+    {
+        return NULL;
+    }
+    return swoole_objects.property[property_id][handle];
+}
+
+void swoole_set_object(zval *object, void *ptr);
+void swoole_set_property(zval *object, int property_id, void *ptr);
+
+#ifdef SWOOLE_SOCKETS_SUPPORT
+php_socket *swoole_convert_to_socket(int sock);
+#endif
+
+zval *php_swoole_get_recv_data(zval *,swEventData *req TSRMLS_DC);
+int php_swoole_get_send_data(zval *zdata, char **str TSRMLS_DC);
+void php_swoole_onClose(swServer *, int fd, int from_id);
 
 ZEND_BEGIN_MODULE_GLOBALS(swoole)
-	uint16_t task_worker_num;
-	uint8_t task_ipc_mode;
-	uint8_t task_auto_start;
-	key_t message_queue_key;
-	uint32_t unixsock_buffer_size;
+    long aio_thread_num;
+    zend_bool display_errors;
+    zend_bool cli;
+    key_t message_queue_key;
+    uint32_t socket_buffer_size;
 ZEND_END_MODULE_GLOBALS(swoole)
 
 extern ZEND_DECLARE_MODULE_GLOBALS(swoole);

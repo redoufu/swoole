@@ -8,7 +8,7 @@
  | http://www.apache.org/licenses/LICENSE-2.0.html                      |
  | If you did not receive a copy of the Apache2.0 license and are unable|
  | to obtain it through the world-wide-web, please send a note to       |
- | license@php.net so we can mail you a copy immediately.               |
+ | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
  +----------------------------------------------------------------------+
@@ -16,6 +16,8 @@
 
 #include "swoole.h"
 #include "async.h"
+
+#ifdef HAVE_GCC_AIO
 
 #include <aio.h>
 
@@ -48,8 +50,8 @@ int swAioGcc_init(int max_aio_events)
     swAioGcc_pipe_read = swoole_aio_pipe.getFd(&swoole_aio_pipe, 0);
     swAioGcc_pipe_write = swoole_aio_pipe.getFd(&swoole_aio_pipe, 1);
 
-    SwooleAIO.reactor->setHandle(SwooleAIO.reactor, SW_FD_AIO, swAioGcc_onFinish);
-    SwooleAIO.reactor->add(SwooleAIO.reactor, swAioGcc_pipe_read, SW_FD_AIO);
+    SwooleG.main_reactor->setHandle(SwooleG.main_reactor, SW_FD_AIO, swAioGcc_onFinish);
+    SwooleG.main_reactor->add(SwooleG.main_reactor, swAioGcc_pipe_read, SW_FD_AIO);
 
     SwooleAIO.callback = swAio_callback_test;
     SwooleAIO.read = swAioGcc_aio_read;
@@ -84,6 +86,7 @@ static int swAioGcc_onFinish(swReactor *reactor, swEvent *event)
             aio_ev.offset = req->aiocb.aio_offset;
             aio_ev.buf = (void *) req->aiocb.aio_buf;
             SwooleAIO.callback(&aio_ev);
+            SwooleAIO.task_num--;
         }
 
         if (req->next == NULL)
@@ -145,6 +148,7 @@ static int swAioGcc_aio_read(int fd, void *outbuf, size_t size, off_t offset)
         swWarn("aio_read failed. Error: %s[%d]", strerror(errno), errno);
         return SW_ERR;
     }
+    SwooleAIO.task_num++;
     return SW_OK;
 }
 
@@ -171,6 +175,7 @@ static int swAioGcc_write(int fd, void *inbuf, size_t size, off_t offset)
     aiocb->aiocb.aio_buf = inbuf;
     aiocb->aiocb.aio_nbytes = size;
     aiocb->aiocb.aio_lio_opcode = LIO_WRITE;
+    aiocb->aiocb.aio_offset = offset;
 
     aiocb->aiocb.aio_sigevent.sigev_notify = SIGEV_SIGNAL;
     aiocb->aiocb.aio_sigevent.sigev_signo = SIGIO;
@@ -180,6 +185,7 @@ static int swAioGcc_write(int fd, void *inbuf, size_t size, off_t offset)
         swWarn("aio_write failed. Error: %s[%d]", strerror(errno), errno);
         return SW_ERR;
     }
+    SwooleAIO.task_num++;
     return SW_OK;
 }
 
@@ -187,3 +193,5 @@ static void swAioGcc_destroy(void)
 {
     swoole_aio_pipe.close(&swoole_aio_pipe);
 }
+
+#endif
